@@ -64,6 +64,18 @@ roles: [student]
 
 **PAGE_SIZE 是硬限制**：任何 DMA 分配都不能超过 4096 字节！
 
+### 缓冲区数量设计（关键！）
+不同设备有不同的缓冲区策略，**必须参考标准实现**：
+
+**Console 设备**：使用少量缓冲区
+- 1 个 send_buffer（发送数据）
+- 1 个 receive_buffer（接收数据）
+
+**Input 设备**：使用缓冲池（标准：64 个 event buffers）
+- ✅ 正确：预分配 64 个 `DmaStream` 放入 `EventTable`
+- ❌ 错误：只用 1 个 buffer，高频率输入会丢失事件
+- **原因**：VirtIO virtqueue 需要多个 in-flight buffers 才能处理并发输入
+
 ### 发送数据流程（Driver → Device）
 1. 用 `writer()` 写入数据到 DMA buffer
 2. **必须调用 `sync_to_device(range)` 同步**
@@ -131,6 +143,11 @@ roles: [student]
 3. **SYN_REPORT 必须提交到子系统**，而不是忽略或提交空数组
 4. 使用 `InputEvent::from_sync_event(SynEvent::Report)` 创建同步事件
 
+**事件批处理语义（重要！）**：
+- ✅ 正确：收集一批事件（存入 Vec），收到 SYN_REPORT 时统一提交
+- ❌ 错误：每个事件立即单独提交，破坏事件流语义
+- **标准模式**：`registered_device.submit_events(&[event1, event2, syn_event])`
+
 **易错点**：SYN_REPORT 不是边界标记，而是必须提交的实际事件，用于通知输入子系统"一组事件已完成"。
 
 ---
@@ -156,6 +173,25 @@ roles: [student]
 **错误做法**：删除未标记 MASK 的函数或修改其他区域
 
 **正确做法**：只修改 MASK 标记的区域
+
+### 🔴 反模式5：过度重构导致编译失败
+**错误做法**：
+- 完全重写文件（如从 573 行重写到 499 行）
+- 引入新的 trait/struct 命名冲突（如重复定义 `InputDevice`）
+- 使用错误的泛型参数（如 `Rcu<Box<Vec<Arc<DmaStream>>>>`）
+- 在未编译验证的情况下提交代码
+
+**正确做法**：
+1. **基于标准答案增量修改**：永远不要从零重写
+2. **每次修改后立即 `cargo check`**：确保编译通过再继续
+3. **遇到编译错误立即停止**：不要提交未完成代码
+4. **使用明确的类型标注**：避免类型推断失败
+5. **复用已有命名空间**：不要引入与现有 trait/struct 冲突的名称
+
+**编译失败诊断**：
+- `trait bound not satisfied` → 检查泛型参数是否符合 trait 约束
+- `found struct but expected trait` → 命名冲突，使用完整路径或改名
+- `type annotations needed` → 添加明确的类型标注
 
 ### 其他反模式
 1. 队列索引混淆：确认每个队列的索引号
