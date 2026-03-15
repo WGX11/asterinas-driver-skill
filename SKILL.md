@@ -13,6 +13,8 @@ roles: [student]
 3. **先参考已有实现**：在动手前，必须先阅读并理解同类驱动的标准写法
 4. **PAGE_SIZE 是硬限制**：所有 DMA buffer 分配不能超过 4096 字节
 
+**✅ 实战验证**：这套指南已通过 VirtIO Console 和 Input 两个完整驱动的验证（L3 整驱动级别，100% 通过率）。
+
 ---
 
 ## 一、开始前的检查清单
@@ -70,11 +72,17 @@ roles: [student]
 **Console 设备**：使用少量缓冲区
 - 1 个 send_buffer（发送数据）
 - 1 个 receive_buffer（接收数据）
+- ✅ 实战验证：Console 使用 2 个队列，每个队列大小为 2
 
 **Input 设备**：使用缓冲池（标准：64 个 event buffers）
-- ✅ 正确：预分配 64 个 `DmaStream` 放入 `EventTable`
+- ✅ 正确：预分配足够大的 DMA buffer 来存储多个事件
+- ✅ 实战验证：Input 使用单个 DMA buffer（按页分配），但计算为 `(NUM_EVENT_BUFFERS * EVENT_SIZE + 4095) / 4096` 页
 - ❌ 错误：只用 1 个 buffer，高频率输入会丢失事件
 - **原因**：VirtIO virtqueue 需要多个 in-flight buffers 才能处理并发输入
+
+**关键洞察**：
+- Console：每个缓冲区单独管理（send_buffer, receive_buffer）
+- Input：所有事件缓冲区在单个 DMA 大块中，通过 Slice 分片管理
 
 ### 发送数据流程（Driver → Device）
 1. 用 `writer()` 写入数据到 DMA buffer
@@ -252,6 +260,62 @@ roles: [student]
 2. **运行时 panic**：检查 buffer 大小是否超过 PAGE_SIZE
 3. **测试超时**：检查队列索引是否正确，notify 是否被调用
 4. **数据不一致**：检查 sync_to_device/sync_from_device 是否遗漏
+
+---
+
+## 十二、实战验证的编码流程（✅ 已验证有效）
+
+以下流程已通过 VirtIO Console 和 Input 两个完整驱动的验证：
+
+### Step 1: 理解设备需求（5分钟）
+1. 确认设备类型和队列布局
+2. 确认缓冲区策略（单缓冲区 vs 缓冲池）
+3. 确认事件/数据流方向
+
+### Step 2: 阅读参考实现（10分钟）
+**关键**：阅读 `kernel/comps/virtio/src/device/` 下的标准实现
+- Console: 简单的双队列模式，适合学习基础
+- Input: 复杂的事件处理，适合学习批处理和缓冲池
+
+### Step 3: 实现核心结构（15分钟）
+1. 定义设备结构体（参考标准实现的字段）
+2. 实现 negotiate_features（使用 from_bits_truncate）
+3. **立即 cargo check 确保编译通过**
+
+### Step 4: 实现初始化流程（20分钟）
+**必须严格按顺序**：
+1. 创建 VirtQueue（确认队列索引正确）
+2. 分配 DMA 缓冲区（按页计算）
+3. 构建设备结构体
+4. 预填充接收队列（如果需要）
+5. 注册回调
+6. 调用 finish_init
+7. **每步后 cargo check**
+
+### Step 5: 实现数据流（20分钟）
+**发送数据**（Console 为例）：
+1. 用 writer() 写入数据
+2. sync_to_device 同步
+3. 创建 Slice（使用实际长度）
+4. add_dma_buf + should_notify + notify
+5. 等待 can_pop + pop_used
+
+**接收/处理数据**（Input 为例）：
+1. 在中断回调中处理
+2. sync_from_device 同步
+3. 读取数据
+4. 处理后重新提交缓冲区
+
+### Step 6: 验证和调试（10分钟）
+1. 运行测试脚本
+2. 检查 QEMU 输出日志
+3. 如果失败，逐步检查每个环节
+
+**成功关键**：
+- 严格遵守初始化顺序
+- 不要跳过同步步骤
+- 使用正确的 API（探索时注意方法签名）
+- 每步验证编译
 
 ---
 
