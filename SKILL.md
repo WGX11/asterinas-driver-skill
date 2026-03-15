@@ -113,13 +113,44 @@ roles: [student]
 - 用 pop_used 取回缓冲区和长度
 - 处理完后要把缓冲区重新放回队列
 
-### 完整发送流程
-1. 写入数据到预分配的 DMA buffer
-2. 调用 sync_to_device 同步
-3. 创建 Slice 并添加到队列
-4. 检查 should_notify 后通知设备
-5. 等待 can_pop 返回 true
-6. 调用 pop_used 取回完成确认
+### 完整发送流程（大数据必须分块循环处理！）
+
+**⚠️ 关键：大数据（> buffer size）必须分块发送，循环等待每次完成**
+
+**标准模式**（Console send 为例）：
+```rust
+let mut reader = VmReader::from(data);
+while reader.remain() > 0 {  // ✅ 循环处理所有数据
+    // 1. 写入一块数据到 buffer
+    let mut writer = self.send_buffer.writer().unwrap();
+    let len = writer.write(&mut reader);
+    
+    // 2. 同步到设备
+    self.send_buffer.sync_to_device(0..len).unwrap();
+    
+    // 3. 创建 Slice 并添加到队列
+    let slice = Slice::new(&self.send_buffer, 0..len);
+    transmit_queue.add_dma_buf(&[&slice], &[]).unwrap();
+    
+    // 4. 通知设备
+    if transmit_queue.should_notify() {
+        transmit_queue.notify();
+    }
+    
+    // 5. 等待当前块传输完成（必须在循环内！）
+    while !transmit_queue.can_pop() {
+        spin_loop();
+    }
+    
+    // 6. 取回传输完成的缓冲区
+    transmit_queue.pop_used().unwrap();
+}
+```
+
+**易错点**：
+- ❌ 只发送前 N 字节就返回（如 `write_len.min(BUFFER_SIZE)`）
+- ❌ 不等待传输完成就返回（跳过 can_pop/pop_used）
+- ✅ **必须**：while 循环 + 每块等待完成 + pop_used 确认
 
 ---
 
@@ -182,7 +213,29 @@ roles: [student]
 
 **正确做法**：只修改 MASK 标记的区域
 
-### 🔴 反模式5：过度重构导致编译失败
+### 🔴 反模式5：大数据不循环处理
+**错误做法**：
+- 只发送前 N 字节就返回（如 `write_len.min(BUFFER_SIZE)`）
+- 不等待传输完成就返回
+- 不使用 while 循环处理剩余数据
+
+**正确做法**：
+```rust
+let mut reader = VmReader::from(data);
+while reader.remain() > 0 {  // ✅ 循环直到所有数据发完
+    // 写入一块
+    let len = writer.write(&mut reader);
+    // 发送这块
+    // ...
+    // 等待完成
+    while !queue.can_pop() { spin_loop(); }
+    queue.pop_used().unwrap();
+}
+```
+
+**实战教训**：VirtIO buffer 有大小限制，大数据必须分块发送并同步等待每块完成。
+
+### 🔴 反模式6：过度重构导致编译失败
 **错误做法**：
 - 完全重写文件（如从 573 行重写到 499 行）
 - 引入新的 trait/struct 命名冲突（如重复定义 `InputDevice`）
@@ -201,7 +254,7 @@ roles: [student]
 - `found struct but expected trait` → 命名冲突，使用完整路径或改名
 - `type annotations needed` → 添加明确的类型标注
 
-### 其他反模式
+### 其他反模式（续）
 1. 队列索引混淆：确认每个队列的索引号
 2. DMA 同步遗漏：必须在数据传输前后同步
 3. 中断嵌套：在回调中直接获取锁而不禁用中断
