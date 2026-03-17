@@ -15,7 +15,7 @@ roles: [student]
 3. **先参考已有实现**：在动手前，必须先阅读并理解同类驱动的标准写法
 4. **PAGE_SIZE 是硬限制**：所有 DMA buffer 分配不能超过 4096 字节
 
-**✅ 实战验证**：这套指南已通过 VirtIO Console 和 Input 两个完整驱动的验证（L3 整驱动级别，100% 通过率）。
+**✅ 实战验证**：这套指南已通过 VirtIO Console、Input 和 Socket 三个完整驱动的验证（L3 整驱动级别）。
 
 **违反核心原则2的典型后果**：
 ```
@@ -43,7 +43,7 @@ XX | mod config;
 
 必须按以下顺序执行：
 1. 创建 VirtQueue（调用 VirtQueue::new）
-2. 分配 DMA 缓冲区（DmaStream::alloc）
+2. 分配 DMA 缓冲区（DmaStream::alloc 或使用 buffer pool）
 3. 构建设备结构体（用 Arc 包装）
 4. 预填充接收队列（add_dma_buf + notify）
 5. 注册中断回调（register_queue_callback）
@@ -53,13 +53,21 @@ XX | mod config;
 
 **关键约束**：必须先创建队列、分配缓冲区，再注册回调，最后调用 finish_init。
 
+**Socket 驱动特殊步骤**：
+1. 在 mod.rs 中初始化全局缓冲池：`buffer::init()`
+2. 创建 **3 个队列**：recv_queue (index=0), send_queue (index=1), event_queue (index=2)
+3. 使用 `SlotVec<RxBuffer>` 管理 64 个接收缓冲区
+4. 从配置空间读取 guest_cid（64位，分两次读取高低32位）
+5. 注册设备到 VSOCK_DEVICE_TABLE（而非直接注册到子系统）
+
 ---
 
 ## 三、参考已有实现（最重要！）
 
 **务必先阅读** `kernel/comps/virtio/src/device/` 下的已有实现：
-- Console 驱动：`console/device.rs`
-- Input 驱动：`input/device.rs`
+- Console 驱动：`console/device.rs`（简单，适合入门）
+- Input 驱动：`input/device.rs`（事件处理，缓冲池）
+- Socket 驱动：`socket/device.rs`（最复杂，连接管理+流控制）
 - Network 驱动：`network/device.rs`
 - Block 驱动：`block/device.rs`
 
@@ -93,9 +101,18 @@ XX | mod config;
 - ❌ 错误：只用 1 个 buffer，高频率输入会丢失事件
 - **原因**：VirtIO virtqueue 需要多个 in-flight buffers 才能处理并发输入
 
+**Socket 设备**：使用 SlotVec 管理多个 RX buffers（最复杂）
+- ✅ 正确：使用 `SlotVec<RxBuffer>` 管理多个接收缓冲区
+- ✅ 正确：必须初始化缓冲池（`buffer::init()`），使用 `RX_BUFFER_POOL` 和 `TX_BUFFER_POOL`
+- ✅ 正确：使用 `RxBuffer` 和 `TxBuffer`（来自 `aster_network`，不是 DmaStream！）
+- ✅ 实战验证：Socket 使用 3 个队列（recv/send/event），每个队列大小为 64
+- ❌ 错误：像Console那样只用1-2个buffer
+- **原因**：Socket需要处理多个并发连接和数据流
+
 **关键洞察**：
 - Console：每个缓冲区单独管理（send_buffer, receive_buffer）
 - Input：所有事件缓冲区在单个 DMA 大块中，通过 Slice 分片管理
+- Socket：使用 SlotVec 动态管理多个 RxBuffer，通过缓冲池分配
 
 ### 发送数据流程（Driver → Device）
 1. 用 `writer()` 写入数据到 DMA buffer
@@ -204,6 +221,84 @@ while reader.remain() > 0 {  // ✅ 循环处理所有数据
 
 ---
 
+## 七（补充2）、VirtIO Socket 连接与流控制
+
+### 队列结构（3个队列！）
+- **recv_queue (index=0)**：接收数据包
+- **send_queue (index=1)**：发送数据包
+- **event_queue (index=2)**：处理事件通知（如live migration）
+- 每个队列大小：64
+
+### 配置空间读取（guest_cid）
+**必须分两次读取64位guest_cid**：
+1. 用 `field_ptr!` 读取 `guest_cid_low`（低32位）
+2. 用 `field_ptr!` 读取 `guest_cid_high`（高32位）
+3. 合并：`low as u64 | (high as u64) << 32`
+
+**原因**：VirtIO spec要求>32位的读取不保证原子性。
+
+### 缓冲区管理（SlotVec + Buffer Pool）
+**关键**：
+- 必须从缓冲池分配（RX_BUFFER_POOL / TX_BUFFER_POOL）
+- 使用 `SlotVec` 动态管理，支持按token取回
+- 初始时必须预填充所有64个buffer（循环调用add_dma_buf）
+- Socket 使用 `RxBuffer` 和 `TxBuffer`（来自 `aster_network`），不是 `DmaStream`！
+
+### 连接管理（状态机）
+Socket支持的连接操作：
+- **request**：发起连接请求（op=Request）
+- **response**：响应连接请求（op=Response）
+- **shutdown**：优雅关闭连接（op=Shutdown）
+- **reset**：强制重置连接（op=Rst）
+- **credit_request**：请求对端发送信用信息（op=CreditRequest）
+- **credit_update**：通知对端自己的信用状态（op=CreditUpdate）
+
+### 流控制与信用机制（最关键！）
+**问题**：发送方不能发送超过接收方缓冲区的数据量。
+
+**解决方案**：信用机制（buf_alloc, fwd_cnt, peer_free）
+- `peer_free = buf_alloc - (fwd_cnt - last_fwd_cnt)`
+- **发送前必须检查** `peer_free >= buffer_len`
+- 如果不足：发送 `CreditRequest` → 等待对端回复 `CreditUpdate` → 重试
+- 标记 `has_pending_credit_request` 避免重复请求
+
+### 数据发送流程（TxBuffer）
+**步骤**：
+1. 从 TX_BUFFER_POOL 分配 TxBuffer
+2. 用 TxBuffer::new 封装 header + payload（VmReader）
+3. add_dma_buf 到 send_queue
+4. notify 通知设备
+5. **必须等待完成**：`while !can_pop { spin_loop(); }` + `pop_used()`
+
+**关键**：Socket 使用 `TxBuffer` 和 `RxBuffer`（来自 `aster_network`），不是 `DmaStream`！
+
+### 数据接收流程
+**步骤**：
+1. `recv_queue.pop_used()` 获取 (token, len)
+2. 从 `rx_buffers` 按 token 移除对应的 RxBuffer
+3. 读取 header 和 payload
+4. **必须补充新的 rx_buffer** 到队列（从 RX_BUFFER_POOL 分配）
+5. notify 通知设备
+
+### 设备注册（全局表）
+**Socket 注册到 VSOCK_DEVICE_TABLE**（模块内部全局表）
+**API**：`register_device()`, `get_device()`, `all_devices()`, `register_recv_callback()`
+
+**关键差异**：
+- Console：直接注册到 `aster_console` 子系统
+- Socket：注册到 `VSOCK_DEVICE_TABLE`（模块内部全局表）
+
+### 最易错点
+1. ❌ 混用 `DmaStream` 和 `RxBuffer/TxBuffer`（Socket必须用后者）
+2. ❌ 忘记初始化缓冲池（`buffer::init()`）
+3. ❌ 不预填充64个rx buffer（导致接收队列空）
+4. ❌ 发送前不检查 `peer_free`（导致缓冲区溢出）
+5. ❌ 读取guest_cid时用 `read_once::<u64>()`（必须分两次读32位）
+6. ❌ 忘记等待发送完成（`can_pop` + `pop_used`）
+7. ❌ 设备注册位置错误（应注册到 `VSOCK_DEVICE_TABLE`）
+
+---
+
 ## 八、常见反模式（禁止！）
 
 ### 🔴 反模式1：过度创新架构
@@ -223,19 +318,9 @@ while reader.remain() > 0 {  // ✅ 循环处理所有数据
 - 调用 `add_dma_buf(stream, &[])` 传递错误类型
 
 **正确做法**：
-```rust
-// ✅ 同步必须传 range 参数
-buffer.sync_from_device(0..len).unwrap();
-buffer.sync_to_device(0..len).unwrap();
-
-// ✅ add_dma_buf 必须传递 Slice 的数组切片
-let slice = Slice::new(&buffer, 0..len);
-queue.add_dma_buf(&[&slice], &[]).unwrap();  // inputs, outputs
-```
-
-**关键约束**：
 - `sync_*` 方法**必须**传递 `Range<usize>` 参数
 - `add_dma_buf` 第一个参数是 `&[&Slice]`，不是 `&Arc<DmaStream>`
+- 先用 `Slice::new(&buffer, range)` 创建切片，再传递
 
 ### 🔴 反模式4：修改 quiz 范围外的代码
 **错误做法**：删除未标记 MASK 的函数或修改其他区域
