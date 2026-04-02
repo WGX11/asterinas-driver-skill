@@ -30,6 +30,57 @@ XX | mod config;
 
 ---
 
+## ⚠️ 提交前必做检查（零容忍）
+
+**以下错误会导致直接编译失败，必须在提交前自行验证：**
+
+### 1. 编译验证（必须通过！）
+```bash
+cd /root/test_repo/asterinas
+make build  # 或 cargo build
+```
+**必须**：0 errors，0 warnings
+
+### 2. 常见低级错误（100%可避免）
+- ❌ **括号不匹配**：`Arc::new(DmaStream::alloc(1, false).unwrap();`  // 缺少闭合 `)`
+- ❌ **代码重复粘贴**：同一个代码块出现两次
+- ❌ **花括号不匹配**：`{` 和 `}` 数量对不上
+- ❌ **缺少 trait 导入**：调用 trait 方法但未 `use` 该 trait
+
+**检查方法**：
+1. IDE / 编辑器会标红语法错误
+2. `cargo check` 会立即报错
+3. **不要等 Judge 告诉你这些基础问题**
+
+### 3. Trait 可见性规则
+**错误示例**：
+```rust
+let writer = buffer.writer().unwrap();  // ❌ 编译错误
+```
+**编译器提示**：
+```
+error[E0599]: no method named `writer` found for struct `DmaStream`
+  --> device.rs:50:25
+   |
+50 |         let writer = buffer.writer().unwrap();
+   |                         ^^^^^^ method not found in `DmaStream`
+   |
+   = help: items from traits can only be used if the trait is in scope
+   = note: the following trait is implemented but not in scope:
+           `HasVmReaderWriter`
+```
+
+**正确做法**：
+```rust
+use ostd::mm::io_util::HasVmReaderWriter;  // ✅ 添加 trait 导入
+
+let writer = buffer.writer().unwrap();     // ✅ 现在可以调用
+```
+
+**关键**：编译器已经告诉你缺什么了，**立即按提示修复**，不要跳过。
+
+---
+
 ## 一、开始前的检查清单
 
 1. 确认设备类型：查看 `transport.device_type()` 返回的 `VirtioDeviceType`
