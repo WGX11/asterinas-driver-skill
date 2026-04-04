@@ -228,113 +228,29 @@ let writer = buffer.writer().unwrap();     // ✅ 现在可以调用
 
 ---
 
-## 七（补充）、VirtIO Input 事件处理
+## 七（补充）、设备特定规则简表
 
-### 事件类型
-- **EV_KEY**: 键盘/按键事件（状态：0=释放，1=按下，2=重复）
-- **EV_REL**: 相对运动事件（鼠标移动）
-- **EV_ABS**: 绝对坐标事件（触摸屏）
-- **SYN_REPORT**: 同步事件（标记一组事件的结束）
-
-### 事件处理流程
-1. 从 EventBuf 读取 `VirtioInputEvent`
-2. 根据 event.type 分发到不同处理器
-3. **SYN_REPORT 必须提交到子系统**，而不是忽略或提交空数组
-4. 使用 `InputEvent::from_sync_event(SynEvent::Report)` 创建同步事件
-
-**事件批处理语义（重要！）**：
-- ✅ 正确：收集一批事件（存入 Vec），收到 SYN_REPORT 时统一提交
-- ❌ 错误：每个事件立即单独提交，破坏事件流语义
-- **标准模式**：`registered_device.submit_events(&[event1, event2, syn_event])`
-
-**易错点**：SYN_REPORT 不是边界标记，而是必须提交的实际事件，用于通知输入子系统"一组事件已完成"。
-
----
-
-## 七（补充2）、VirtIO Socket 连接与流控制
-
-### 队列结构（3个队列！）
-- **recv_queue (index=0)**：接收数据包
-- **send_queue (index=1)**：发送数据包
-- **event_queue (index=2)**：处理事件通知（如live migration）
-- 每个队列大小：64
-
-### 配置空间读取（guest_cid）
-**必须分两次读取64位guest_cid**：
-1. 用 `field_ptr!` 读取 `guest_cid_low`（低32位）
-2. 用 `field_ptr!` 读取 `guest_cid_high`（高32位）
-3. 合并：`low as u64 | (high as u64) << 32`
-
-**原因**：VirtIO spec要求>32位的读取不保证原子性。
-
-### 缓冲区管理（SlotVec + Buffer Pool）
-**关键**：
-- 必须从缓冲池分配（RX_BUFFER_POOL / TX_BUFFER_POOL）
-- 使用 `SlotVec` 动态管理，支持按token取回
-- 初始时必须预填充所有64个buffer（循环调用add_dma_buf）
-- Socket 使用 `RxBuffer` 和 `TxBuffer`（来自 `aster_network`），不是 `DmaStream`！
-
-### 连接管理（状态机）
-Socket支持的连接操作：
-- **request**：发起连接请求（op=Request）
-- **response**：响应连接请求（op=Response）
-- **shutdown**：优雅关闭连接（op=Shutdown）
-- **reset**：强制重置连接（op=Rst）
-- **credit_request**：请求对端发送信用信息（op=CreditRequest）
-- **credit_update**：通知对端自己的信用状态（op=CreditUpdate）
-
-### 流控制与信用机制（最关键！）
-**问题**：发送方不能发送超过接收方缓冲区的数据量。
-
-**解决方案**：信用机制（buf_alloc, fwd_cnt, peer_free）
-- `peer_free = buf_alloc - (fwd_cnt - last_fwd_cnt)`
-- **发送前必须检查** `peer_free >= buffer_len`
-- 如果不足：发送 `CreditRequest` → 等待对端回复 `CreditUpdate` → 重试
-- 标记 `has_pending_credit_request` 避免重复请求
-
-### 数据发送流程（TxBuffer）
-**步骤**：
-1. 从 TX_BUFFER_POOL 分配 TxBuffer
-2. 用 TxBuffer::new 封装 header + payload（VmReader）
-3. add_dma_buf 到 send_queue
-4. notify 通知设备
-5. **必须等待完成**：`while !can_pop { spin_loop(); }` + `pop_used()`
-
-**关键**：Socket 使用 `TxBuffer` 和 `RxBuffer`（来自 `aster_network`），不是 `DmaStream`！
-
-### 数据接收流程
-**步骤**：
-1. `recv_queue.pop_used()` 获取 (token, len)
-2. 从 `rx_buffers` 按 token 移除对应的 RxBuffer
-3. 读取 header 和 payload
-4. **必须补充新的 rx_buffer** 到队列（从 RX_BUFFER_POOL 分配）
-5. notify 通知设备
-
-### 设备注册（全局表）
-**Socket 注册到 VSOCK_DEVICE_TABLE**（模块内部全局表）
-**API**：`register_device()`, `get_device()`, `all_devices()`, `register_recv_callback()`
-
-**关键差异**：
-- Console：直接注册到 `aster_console` 子系统
-- Socket：注册到 `VSOCK_DEVICE_TABLE`（模块内部全局表）
-
-### 最易错点
-1. ❌ 混用 `DmaStream` 和 `RxBuffer/TxBuffer`（Socket必须用后者）
-2. ❌ 忘记初始化缓冲池（`buffer::init()`）
-3. ❌ 不预填充64个rx buffer（导致接收队列空）
-4. ❌ 发送前不检查 `peer_free`（导致缓冲区溢出）
-5. ❌ 读取guest_cid时用 `read_once::<u64>()`（必须分两次读32位）
-6. ❌ 忘记等待发送完成（`can_pop` + `pop_used`）
-7. ❌ 设备注册位置错误（应注册到 `VSOCK_DEVICE_TABLE`）
-8. ❌ **receive方法中set_packet_len参数错误**（关键！）
-   - 错误：`rx_buffer.set_packet_len(len as usize)`（len包含header）
-   - 正确：`rx_buffer.set_packet_len(len as usize - size_of::<VirtioVsockHdr>())`
-   - 原因：`pop_used()`返回的len包含header和payload，但buf()读取时只应包含payload
-   - 参考：network设备的实现也是这样做的
+**Input驱动**：批处理事件+SYN_REPORT必须提交，参考input/device.rs
+**Socket驱动**：SlotVec+缓冲池+流控制+guest_cid分两次读取，参考socket/device.rs完整流程
 
 ---
 
 ## 八、VirtIO Block 驱动（异步队列模式）
+
+### ⚠️ 核心架构原则（必读！）
+
+**1. 绝对禁止删除 mod.rs 中的类型定义！**
+- ❌ 错误：将 mod.rs 从 206 行缩减到 6 行
+- ✅ 正确：保留所有未标记 MASK 的代码（BioRequestSingleQueue、VirtioBlockConfig等）
+- **失败案例**：删除类型定义 → 50+ 编译错误
+
+**2. 必须使用 BioRequest 架构**
+- ❌ 错误：直接实现 `BlockDeviceOps for SubmittedBio`
+- ✅ 正确：使用 `BioRequestSingleQueue` + `BioRequest` 管理队列
+
+**3. 异步队列模式**
+- ❌ 错误：busy-wait（`while !can_pop() { spin_loop() }`）
+- ✅ 正确：提交请求→立即返回→中断处理完成
 
 ### 核心架构模式
 **VirtIO Block 驱动使用异步队列模式**，与 Console/Input 的同步模式完全不同：
